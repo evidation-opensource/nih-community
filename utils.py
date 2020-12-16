@@ -1,13 +1,10 @@
-# Databricks notebook source
-# MAGIC %md # NIH COMmunity utilities
-
-# COMMAND ----------
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve, classification_report
+from xgboost import XGBClassifier
+from time import time
 
 idx = pd.IndexSlice
 
@@ -48,24 +45,29 @@ def generate_normalized_hr_sample(random_state=1729, split='train', ili_type=3):
     
     healthy_miss_fraction = 0.1
     illness_miss_fraction = 0.2
+    healthy_dist_param = [0, 0.3]
+    illness_dist_param = [0, 0.4]
     
-    dict_ili = {1:{'hr_max':  {0: [0, 1], 1: [-0.1, 1]},
-                   'rhr': {0: [0, 1], 1: [0, 1]},
-                   'hr_stdv': {0: [0, 1], 1: [-0.3, 1]},
-                   'hr_50pct':  {0: [0, 1], 1: [-0.2, 1]},
-                   'miss_fraction': {0:0.1, 1:0.15}
+    dict_ili = {1:{'hr_max': -0.1, ## ILI
+                   'rhr':0.05,
+                   'hr_stdv': -0.3,
+                   'hr_50pct': -0.2,
+                   'miss_fraction': {0:0.1, 1:0.15, 2:0.1},
+                   'pivot': 2
                    },
-                2:{'hr_max':  {0: [0, 1], 1: [-0.2, 1]},
-                   'rhr': {0: [0, 1], 1: [0.1, 1]},
-                   'hr_stdv': {0: [0, 1], 1: [-0.5, 1]},
-                   'hr_50pct':  {0: [0, 1], 1: [-0.3, 1]},
-                   'miss_fraction': {0: 0.1, 1:0.2}
+                2:{'hr_max': -0.2, ## FLU
+                   'rhr': 0.1,
+                   'hr_stdv': -0.4,
+                   'hr_50pct': -0.3,
+                   'miss_fraction': {0: 0.1, 1:0.2, 2:0.1},
+                   'pivot': 3
                    },
-                3:{'hr_max':  {0: [0, 1], 1: [-0.6, 1]},
-                   'rhr': {0: [0, 1], 1: [0.4, 1]},
-                   'hr_stdv': {0: [0, 1], 1: [-1, 1]},
-                   'hr_50pct':  {0: [0, 1], 1: [-0.7, 1]},
-                   'miss_fraction': {0: 0.1, 1: 0.25}
+                3:{'hr_max': -0.4, ## COVID
+                   'rhr': 0.3,
+                   'hr_stdv': -0.6,
+                   'hr_50pct': -0.5,
+                   'miss_fraction': {0: 0.1, 1: 0.25, 2:0.2},
+                   'pivot': 4
                    }
                }
     
@@ -74,17 +76,31 @@ def generate_normalized_hr_sample(random_state=1729, split='train', ili_type=3):
               pd.to_datetime(onset_date) + pd.Timedelta('14d'),
              )
     
-    col_names = ['heart_rate__not_moving__max', 'heart_rate__resting_heart_rate', 
-                'heart_rate__stddev', 'heart_rate__perc_50th']
+    col_names = {'hr_max': 'heart_rate__not_moving__max',
+                 'rhr': 'heart_rate__resting_heart_rate',
+                 'hr_stdv': 'heart_rate__stddev',
+                 'hr_50pct': 'heart_rate__perc_50th'
+                 }
     n_cols = len(col_names)
     
+    def _linear_trend(peak, trough, width, days):
+        step = (peak-trough)/width
+        return np.pad(np.concatenate([np.arange(trough, peak, step)+step,
+                                      np.arange(peak,trough, -step)-step]), 
+                                      (0,days-2*width), constant_values=trough)
+    
     def _sample_hr(rnd, days, label, ili_type):
-          return np.column_stack([rnd.normal(dict_ili[ili_type]['hr_max'][label][0], dict_ili[ili_type]['hr_max'][label][1], days),
-                                  rnd.normal(dict_ili[ili_type]['rhr'][label][0], dict_ili[ili_type]['rhr'][label][1], days),
-                                  rnd.normal(dict_ili[ili_type]['hr_stdv'][label][0], dict_ili[ili_type]['hr_stdv'][label][1], days),
-                                  rnd.normal(dict_ili[ili_type]['hr_50pct'][label][0], dict_ili[ili_type]['hr_50pct'][label][1], days),
-                                  0+(rnd.uniform(0,1,days) < dict_ili[ili_type]['miss_fraction'][label])
-                                  ])
+        if label==1:
+            return np.column_stack([rnd.normal(illness_dist_param[0], illness_dist_param[1], [days, len(col_names)]) +\
+                                    np.column_stack([_linear_trend(dict_ili[ili_type][colz], illness_dist_param[0], dict_ili[ili_type]['pivot'], days)
+                                                     for colz in col_names.keys()]),
+                                   0+(rnd.uniform(0,1,days) < dict_ili[ili_type]['miss_fraction'][label])
+                                    ])
+        
+        else:
+            return np.column_stack([rnd.normal(healthy_dist_param[0], healthy_dist_param[1], [days, len(col_names)]),
+                                    0+(rnd.uniform(0,1,days) < dict_ili[ili_type]['miss_fraction'][label])
+                                    ])
       
     def _add_shifts(x, rows, cols):
         if rows==0:
@@ -93,14 +109,14 @@ def generate_normalized_hr_sample(random_state=1729, split='train', ili_type=3):
         y[:] = np.nan
         return np.row_stack([y, x[:-rows,:]])
     
-    dat = np.row_stack([_sample_hr(rnd, 26, 0, ili_type),
-                      _sample_hr(rnd, 10, 1, ili_type),
+    dat = np.row_stack([_sample_hr(rnd, 27, 0, ili_type),
+                      _sample_hr(rnd, 9, 1, ili_type),
                       _sample_hr(rnd, 7, 0, ili_type)
                        ])
     dat[dat[:,-1]==1, :-1] = np.nan ### add missing values
     
     out = pd.DataFrame(np.column_stack([_add_shifts(dat[:,:-1], 1, n_cols) for i in range(shifts)]),
-                       columns=pd.MultiIndex.from_product([[str(i)+'days_ago' for i in range(shifts)], col_names]),
+                       columns=pd.MultiIndex.from_product([[str(i)+'days_ago' for i in range(shifts)], col_names.values()]),
                        index=pd.MultiIndex.from_product([[participant_id], dt], names=['id_participant_external', 'dt'])
         )
         
@@ -292,6 +308,53 @@ dict_hue = {'ILI': sns_hue[0],
             'Healthy': sns_hue[2], 
             'Flu': sns_hue[3]}
 
+ili_type_map = {0:'Healthy', 1: 'ILI', 2: 'Flu', 3: 'COVID-19'}
+
+def plot_trend_lines(df, plot_cols, use_palette, use_hue_order, type_col=('labels', 'Type'),
+                     ts_col = ('labels', "days_since_onset"), ci=67, ts_cut=30, ts_step=4, line_color='coral',
+                     per_row=2, thick=2, plot_width=5, plot_height=4, sharex=False, sharey=True, grid=False):
+  
+    plotz = len(plot_cols)
+    rowz = plotz // per_row + 0+(plotz % per_row > 0)
+    
+    fig, axes = plt.subplots(nrows=rowz, ncols=per_row, figsize=(plot_width*per_row, plot_height*rowz), sharey=sharey, sharex=sharex)
+    keep_rows = (df[ts_col] >= -ts_cut) & (df[ts_col] <= ts_cut)
+    (ts_min, ts_max) = df[keep_rows].agg({ts_col: ['min', 'max']}).unstack().values
+    print(ts_min, ts_max)
+    
+    for ft_col, ax in zip(plot_cols, axes.flatten() if type(axes) == np.ndarray else [axes]):
+        
+        if type(ft_col) == tuple:
+          colr = ft_col[-1]
+        else:
+          colr = ft_col
+      
+        if type(ts_col) == tuple:
+          xlabel = ts_col[-1]
+        else:
+          xlabel = ts_col
+
+        sns.lineplot(x=ts_col, y=ft_col, hue=type_col, data=df.loc[keep_rows,:],
+                     palette = use_palette,
+                     hue_order = use_hue_order,
+                     ax=ax, ci=ci, color=line_color, linewidth=thick)
+
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles=handles[1:], labels=labels[1:], fontsize=14)
+        ax.axvline(x=0, c='k', ls='--')
+        ax.axhline(y=0, c='k', ls='--')
+        ax.set_xticks(np.arange(ts_min, ts_max+1, ts_step))
+        ax.set_title(colr.replace('__',' : ').replace('_',' ').capitalize(), fontsize=16)
+        ax.set_xlabel(xlabel.replace('_',' ').capitalize(), fontsize=14)
+        ax.set_ylabel('')
+        
+        if grid:
+            ax.grid()
+
+    plt.tight_layout()
+    plt.close() 
+    return fig
+
 def single_plot_missing_performance(y_val, yh_val, X_val, title='Healthy v. ILI', min_N=10):
     out_val = pd.DataFrame(np.column_stack([y_val.values, yh_val, X_val.isna().sum(axis=1)/X_val.shape[1]]), index=y_val.index, columns=['gt', 'prob', 'frac'])
     fig, ax = plt.subplots(1, 1, figsize=(7,5))
@@ -304,7 +367,8 @@ def single_plot_missing_performance(y_val, yh_val, X_val, title='Healthy v. ILI'
                               'AUROC': roc_auc_score(out_val.loc[out_val.frac <= q, 'gt'], out_val.loc[out_val.frac <= q, 'prob'])} 
                              for q in np.arange(0, 1.05, 0.05) if (out_val.frac <= q).sum() >= min_N])
     
-    plot_roc.plot(x='frac', y=['Class-0 mean', 'Class-1 mean', 'AUROC', 'Data Fraction'], ax=ax, color=['C0', 'orange', 'k', 'coral'], style=['-', '-', '--', '-.'], linewidth=2)
+    plot_roc.plot(x='frac', y=['Class-0 mean', 'Class-1 mean', 'AUROC', 'Data Fraction'], ax=ax, 
+                  color=['C0', 'orange', 'k', 'coral'], style=['-', '-', '--', '-.'], linewidth=2)
     
     #sns.lineplot(x='frac', y='prob', hue='True label', data=out_val.rename(columns={'gt': 'True label'}), ax=ax[1], lw=2)
     #plot_roc.plot(x='frac', y='AUROC', ax=ax[1], color='k', style='--', linewidth=2)
@@ -315,10 +379,9 @@ def single_plot_missing_performance(y_val, yh_val, X_val, title='Healthy v. ILI'
     ax.legend(fontsize=12)
     plt.xticks(fontsize=12)
     plt.yticks(fontsize=12)
-  
-    display(fig)  
+    plt.close()  
+    return fig
    
-  
 def plot_roc(fpr, tpr):
     fig = plt.figure(figsize=(5,4))
     plt.plot([0, 1], [0, 1], 'k--')
@@ -326,7 +389,8 @@ def plot_roc(fpr, tpr):
     plt.xlabel('False positive rate')
     plt.ylabel('True positive rate')
     plt.grid()
-    display(fig)
+    plt.close() 
+    return fig
 
 def plot_spec_recall_since_onset(pred, plot_df, use_spec, spec_thresh_col, use_palette, use_hue_order, set_tag, max_missing_frac, cumsum_col, count_col, y_tag='COVID-19', dataset_tag='LSFS', hue_col='Type', x_col='days_since_onset_v43', ci=67, xticks_range=np.arange(-28,15,4)):
 
@@ -355,12 +419,12 @@ def plot_spec_recall_since_onset(pred, plot_df, use_spec, spec_thresh_col, use_p
     ax.axvline(x=0, c='k', ls=':', alpha=0.5)
     ax.axhline(y=threshold_line, c='k', ls=':', alpha=0.7)
     ax.set_xticks(xticks_range)
-    plt.xticks(fontsize=12)
+    plt.xticks(fontsize=12);
     ax.legend(fontsize=14) ##loc='upper left', 
-    plt.yticks(fontsize=12)
+    plt.yticks(fontsize=12);
     ax.set_ylabel(f'Fraction positive predictions\n for {y_tag}', fontsize=16)
     ax.set_xlabel('Days since onset', fontsize=16)
     #ax.set_title(f'{dataset_tag}: {set_tag}-set predictions\n {100*use_spec:.0f}% specificity, max-{100*max_missing_frac:.0f}% missing', fontsize=18)
     ax.set_title(f'{dataset_tag}: {set_tag} \n {100*use_spec:.0f}% specificity threshold, max-{100*max_missing_frac:.0f}% missing data', fontsize=18)
-      
+    plt.close() 
     return fig, ax
